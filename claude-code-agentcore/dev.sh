@@ -9,10 +9,37 @@ GENERATED_CONFIG_DIR="${GENERATED_CONFIG_DIR:-${SCRIPT_DIR}/generated}"
 
 load_env_file() {
   if [[ -f "$ENV_FILE" ]]; then
-    # shellcheck disable=SC1090
-    set -a
-    source "$ENV_FILE"
-    set +a
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      [[ -n "$line" ]] || continue
+      [[ "$line" == \#* ]] || [[ "$line" == export\ * ]] || true
+
+      if [[ "$line" == export\ * ]]; then
+        line="${line#export }"
+        line="${line#"${line%%[![:space:]]*}"}"
+      fi
+      [[ -n "$line" && "$line" != \#* ]] || continue
+      [[ "$line" == *=* ]] || continue
+
+      key="${line%%=*}"
+      value="${line#*=}"
+      key="${key%"${key##*[![:space:]]}"}"
+      key="${key#"${key%%[![:space:]]*}"}"
+      value="${value#"${value%%[![:space:]]*}"}"
+      value="${value%"${value##*[![:space:]]}"}"
+
+      if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+
+      if [[ -z "${!key+x}" ]]; then
+        export "$key=$value"
+      fi
+    done < "$ENV_FILE"
   fi
 }
 
@@ -368,6 +395,7 @@ WORKLOAD_IDENTITY_NAME_PREFIX=${WORKLOAD_IDENTITY_NAME_PREFIX:-<unset>}
 LOCAL_IMAGE_NAME=${LOCAL_IMAGE_NAME}
 LOCAL_CONTAINER_NAME=${LOCAL_CONTAINER_NAME}
 LOCAL_PORT=${LOCAL_PORT}
+LOCAL_SESSION_ID=${LOCAL_SESSION_ID}
 DOCKERFILE_PATH=${DOCKERFILE_PATH}
 DOCKER_CONTEXT=${DOCKER_CONTEXT}
 DOCKER_BUILD_PLATFORM=${DOCKER_BUILD_PLATFORM:-<default>}
@@ -601,6 +629,91 @@ probe_aws() {
 }
 
 
+async_start_local() {
+  require_cmd python3
+  local prompt="${1:-$DEFAULT_LOCAL_PROMPT}"
+  python3 "${SCRIPT_DIR}/sticky_session_client.py" \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --runtime-arn "$AGENT_RUNTIME_ARN" \
+    --runtime-qualifier "$RUNTIME_QUALIFIER" \
+    --session-id "$LOCAL_SESSION_ID" \
+    --operation async-start \
+    --endpoint-url "http://127.0.0.1:${LOCAL_PORT}" \
+    --prompts "$prompt"
+}
+
+
+async_start_aws() {
+  require_cmd python3
+  local prompt="${1:-$DEFAULT_LOCAL_PROMPT}"
+  python3 "${SCRIPT_DIR}/sticky_session_client.py" \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --runtime-arn "$AGENT_RUNTIME_ARN" \
+    --runtime-qualifier "$RUNTIME_QUALIFIER" \
+    --session-id "$LOCAL_SESSION_ID" \
+    --operation async-start \
+    --prompts "$prompt"
+}
+
+
+async_status_local() {
+  require_cmd python3
+  local task_id="${1:-}"
+  [[ -n "$task_id" ]] || die "task id required"
+  python3 "${SCRIPT_DIR}/sticky_session_client.py" \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --runtime-arn "$AGENT_RUNTIME_ARN" \
+    --runtime-qualifier "$RUNTIME_QUALIFIER" \
+    --session-id "$LOCAL_SESSION_ID" \
+    --operation async-status \
+    --task-id "$task_id" \
+    --endpoint-url "http://127.0.0.1:${LOCAL_PORT}"
+}
+
+
+async_status_aws() {
+  require_cmd python3
+  local task_id="${1:-}"
+  [[ -n "$task_id" ]] || die "task id required"
+  python3 "${SCRIPT_DIR}/sticky_session_client.py" \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --runtime-arn "$AGENT_RUNTIME_ARN" \
+    --runtime-qualifier "$RUNTIME_QUALIFIER" \
+    --session-id "$LOCAL_SESSION_ID" \
+    --operation async-status \
+    --task-id "$task_id"
+}
+
+
+async_list_local() {
+  require_cmd python3
+  python3 "${SCRIPT_DIR}/sticky_session_client.py" \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --runtime-arn "$AGENT_RUNTIME_ARN" \
+    --runtime-qualifier "$RUNTIME_QUALIFIER" \
+    --session-id "$LOCAL_SESSION_ID" \
+    --operation async-list \
+    --endpoint-url "http://127.0.0.1:${LOCAL_PORT}"
+}
+
+
+async_list_aws() {
+  require_cmd python3
+  python3 "${SCRIPT_DIR}/sticky_session_client.py" \
+    --profile "$AWS_PROFILE" \
+    --region "$AWS_REGION" \
+    --runtime-arn "$AGENT_RUNTIME_ARN" \
+    --runtime-qualifier "$RUNTIME_QUALIFIER" \
+    --session-id "$LOCAL_SESSION_ID" \
+    --operation async-list
+}
+
+
 invoke_local() {
   require_cmd curl
   require_cmd python3
@@ -805,6 +918,16 @@ Commands:
   ping-aws              Call the deployed runtime ping path through sticky_session_client.py
   probe-local           Call the lightweight local POST /invocations probe
   probe-aws             Call the lightweight signed AWS POST /invocations probe
+  async-start-local [prompt]
+                        Start a local background task over POST /invocations
+  async-start-aws [prompt]
+                        Start a deployed background task over signed POST /invocations
+  async-status-local <task_id>
+                        Fetch one local background task status
+  async-status-aws <task_id>
+                        Fetch one deployed background task status
+  async-list-local      List local background tasks for the current session
+  async-list-aws        List deployed background tasks for the current session
   invoke-local [prompt] Call local POST /invocations with SSE enabled
   ws-local [prompt]     Call the local WebSocket endpoint directly
   ws-aws [prompt]       Call the deployed AgentCore WebSocket endpoint
@@ -828,6 +951,7 @@ Examples:
   ./dev.sh build
   ./dev.sh run
   ./dev.sh smoke-local "Reply with exactly ok"
+  ./dev.sh async-start-local "Research the latest Bedrock AgentCore pricing and summarize it"
   ./dev.sh release
   IMAGE_TAG=v8 ./dev.sh deploy
 EOF
@@ -889,6 +1013,24 @@ main() {
       ;;
     probe-aws)
       probe_aws
+      ;;
+    async-start-local)
+      async_start_local "${1:-}"
+      ;;
+    async-start-aws)
+      async_start_aws "${1:-}"
+      ;;
+    async-status-local)
+      async_status_local "${1:-}"
+      ;;
+    async-status-aws)
+      async_status_aws "${1:-}"
+      ;;
+    async-list-local)
+      async_list_local
+      ;;
+    async-list-aws)
+      async_list_aws
       ;;
     invoke-local)
       invoke_local "${1:-}"

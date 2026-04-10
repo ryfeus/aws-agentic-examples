@@ -68,6 +68,7 @@ DEFAULT_WS_URL_EXPIRES = 300
 EVENT_STREAM_CONTENT_TYPE = "text/event-stream"
 SESSION_HEADER = "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"
 PROBE_REQUEST_FIELD = "__agentcore_probe__"
+ASYNC_REQUEST_FIELD = "__agentcore_async__"
 
 
 def normalize_session_id(value: str) -> str:
@@ -92,12 +93,40 @@ def require_runtime_arn(
     )
 
 
+def prompt_from_args(
+    prompts: list[str] | None,
+    *,
+    parser: argparse.ArgumentParser,
+    operation: str,
+) -> str:
+    if prompts:
+        return "\n".join(prompts)
+    parser.error(f"--operation {operation} requires --prompts.")
+
+
 def encode_runtime_identifier(value: str) -> str:
     return quote(value, safe="")
 
 
 def probe_payload() -> bytes:
     return json.dumps({PROBE_REQUEST_FIELD: True}).encode("utf-8")
+
+
+def async_payload(
+    action: str,
+    prompt: str | None = None,
+    task_id: str | None = None,
+) -> bytes:
+    payload: dict[str, Any] = {
+        ASYNC_REQUEST_FIELD: {
+            "action": action,
+        }
+    }
+    if prompt is not None:
+        payload["prompt"] = prompt
+    if task_id:
+        payload[ASYNC_REQUEST_FIELD]["task_id"] = task_id
+    return json.dumps(payload).encode("utf-8")
 
 
 def invoke(
@@ -220,12 +249,13 @@ def ping_runtime(
         }
 
 
-def probe_runtime(
+def post_invocations_payload(
     boto_session: boto3.Session,
     runtime_arn: str,
     region: str,
     session_id: str,
     qualifier: str,
+    payload: bytes,
     endpoint_url: str | None = None,
 ) -> dict[str, Any]:
     ssl_context = create_https_ssl_context(boto_session)
@@ -234,7 +264,6 @@ def probe_runtime(
         "Content-Type": "application/json",
         SESSION_HEADER: session_id,
     }
-    payload = probe_payload()
 
     if endpoint_url:
         url = f"{endpoint_url.rstrip('/')}/invocations"
@@ -242,7 +271,7 @@ def probe_runtime(
     else:
         credentials = boto_session.get_credentials()
         if credentials is None:
-            raise RuntimeError("No AWS credentials available for probe request signing.")
+            raise RuntimeError("No AWS credentials available for request signing.")
 
         frozen_credentials = credentials.get_frozen_credentials()
         encoded_runtime_arn = encode_runtime_identifier(runtime_arn)
@@ -283,6 +312,84 @@ def probe_runtime(
             "runtime_session_id": session_id,
             "url": url,
         }
+
+
+def probe_runtime(
+    boto_session: boto3.Session,
+    runtime_arn: str,
+    region: str,
+    session_id: str,
+    qualifier: str,
+    endpoint_url: str | None = None,
+) -> dict[str, Any]:
+    return post_invocations_payload(
+        boto_session=boto_session,
+        runtime_arn=runtime_arn,
+        region=region,
+        session_id=session_id,
+        qualifier=qualifier,
+        payload=probe_payload(),
+        endpoint_url=endpoint_url,
+    )
+
+
+def async_start_runtime(
+    boto_session: boto3.Session,
+    runtime_arn: str,
+    region: str,
+    session_id: str,
+    qualifier: str,
+    prompt: str,
+    endpoint_url: str | None = None,
+) -> dict[str, Any]:
+    return post_invocations_payload(
+        boto_session=boto_session,
+        runtime_arn=runtime_arn,
+        region=region,
+        session_id=session_id,
+        qualifier=qualifier,
+        payload=async_payload("start", prompt=prompt),
+        endpoint_url=endpoint_url,
+    )
+
+
+def async_status_runtime(
+    boto_session: boto3.Session,
+    runtime_arn: str,
+    region: str,
+    session_id: str,
+    qualifier: str,
+    task_id: str,
+    endpoint_url: str | None = None,
+) -> dict[str, Any]:
+    return post_invocations_payload(
+        boto_session=boto_session,
+        runtime_arn=runtime_arn,
+        region=region,
+        session_id=session_id,
+        qualifier=qualifier,
+        payload=async_payload("status", task_id=task_id),
+        endpoint_url=endpoint_url,
+    )
+
+
+def async_list_runtime(
+    boto_session: boto3.Session,
+    runtime_arn: str,
+    region: str,
+    session_id: str,
+    qualifier: str,
+    endpoint_url: str | None = None,
+) -> dict[str, Any]:
+    return post_invocations_payload(
+        boto_session=boto_session,
+        runtime_arn=runtime_arn,
+        region=region,
+        session_id=session_id,
+        qualifier=qualifier,
+        payload=async_payload("list"),
+        endpoint_url=endpoint_url,
+    )
 
 
 def generate_presigned_websocket_url(
@@ -397,12 +504,73 @@ def print_probe_result(result: dict[str, Any], show_json: bool) -> None:
     )
 
 
+def print_async_result(result: dict[str, Any], show_json: bool) -> None:
+    if show_json:
+        print(json.dumps(result, indent=2))
+        return
+
+    body = result.get("body", {})
+    action = body.get("async_action", "?")
+
+    if action == "start":
+        task = body.get("async_task", {})
+        print(
+            "async> "
+            f"http_status={result.get('status_code', '?')} "
+            f"action=start "
+            f"task_id={task.get('task_id', '?')} "
+            f"status={task.get('status', '?')}"
+        )
+        print(f"session> id={body.get('runtime_session_id', result.get('runtime_session_id', '?'))}")
+        return
+
+    if action == "status":
+        task = body.get("async_task", {})
+        print(
+            "async> "
+            f"http_status={result.get('status_code', '?')} "
+            f"action=status "
+            f"task_id={task.get('task_id', '?')} "
+            f"status={task.get('status', '?')}"
+        )
+        if task.get("response_preview"):
+            print(f"assistant> {task['response_preview']}")
+        if task.get("error"):
+            print(f"error> {task['error']}")
+        print(f"session> id={body.get('runtime_session_id', result.get('runtime_session_id', '?'))}")
+        return
+
+    if action == "list":
+        tasks = body.get("async_tasks", [])
+        print(
+            "async> "
+            f"http_status={result.get('status_code', '?')} "
+            f"action=list "
+            f"active={body.get('active_async_task_count', '?')} "
+            f"tasks={len(tasks)}"
+        )
+        for task in tasks:
+            print(
+                "task> "
+                f"id={task.get('task_id', '?')} "
+                f"status={task.get('status', '?')} "
+                f"created_at={task.get('created_at', '?')}"
+            )
+        print(f"session> id={body.get('runtime_session_id', result.get('runtime_session_id', '?'))}")
+        return
+
+    print(json.dumps(result, indent=2))
+
+
 def print_help(transport: str) -> None:
     print("Commands:")
     print("  /help     Show this help")
     if transport == "http":
         print("  /ping     Call GET /ping for the current session")
         print("  /probe    Call a lightweight POST /invocations probe for the current session")
+        print("  /async <prompt>  Start a background task for the current session")
+        print("  /task <task_id>  Fetch status for one background task")
+        print("  /tasks    List background tasks for the current session")
     print("  /session  Show the current runtime session ID")
     print("  /new      Start using a fresh runtime session ID")
     print("  /quit     Exit")
@@ -752,6 +920,43 @@ def interactive_http_session(
             )
             print_probe_result(result, show_json=show_json)
             continue
+        if prompt.startswith("/async "):
+            async_prompt = prompt[len("/async ") :].strip()
+            result = async_start_runtime(
+                boto_session=boto_session,
+                runtime_arn=runtime_arn,
+                region=region,
+                session_id=current_session_id,
+                qualifier=runtime_qualifier,
+                prompt=async_prompt,
+                endpoint_url=endpoint_url,
+            )
+            print_async_result(result, show_json=show_json)
+            continue
+        if prompt == "/tasks":
+            result = async_list_runtime(
+                boto_session=boto_session,
+                runtime_arn=runtime_arn,
+                region=region,
+                session_id=current_session_id,
+                qualifier=runtime_qualifier,
+                endpoint_url=endpoint_url,
+            )
+            print_async_result(result, show_json=show_json)
+            continue
+        if prompt.startswith("/task "):
+            task_id = prompt[len("/task ") :].strip()
+            result = async_status_runtime(
+                boto_session=boto_session,
+                runtime_arn=runtime_arn,
+                region=region,
+                session_id=current_session_id,
+                qualifier=runtime_qualifier,
+                task_id=task_id,
+                endpoint_url=endpoint_url,
+            )
+            print_async_result(result, show_json=show_json)
+            continue
         if prompt == "/session":
             print(f"sticky_session_id={current_session_id}")
             continue
@@ -812,9 +1017,9 @@ def main() -> None:
     parser.add_argument("--session-id", default=f"sticky-{uuid.uuid4()}")
     parser.add_argument(
         "--operation",
-        choices=("invoke", "ping", "probe"),
+        choices=("invoke", "ping", "probe", "async-start", "async-status", "async-list"),
         default="invoke",
-        help="Choose agent invocation, GET /ping health check, or lightweight POST /invocations probe.",
+        help="Choose agent invocation, GET /ping health check, lightweight POST /invocations probe, or async task controls.",
     )
     parser.add_argument(
         "--transport",
@@ -834,6 +1039,10 @@ def main() -> None:
         "--prompts",
         nargs="+",
         help="Run in batch mode with the provided prompts. If omitted, starts an interactive session.",
+    )
+    parser.add_argument(
+        "--task-id",
+        help="Task ID for --operation async-status.",
     )
     parser.add_argument(
         "--compare-new-session",
@@ -869,7 +1078,7 @@ def main() -> None:
     boto_session = boto3.Session(profile_name=args.profile, region_name=args.region)
     client = boto_session.client("bedrock-agentcore")
 
-    if args.operation in {"ping", "probe"}:
+    if args.operation in {"ping", "probe", "async-start", "async-status", "async-list"}:
         if args.transport != "http":
             parser.error(f"--operation {args.operation} only supports --transport http.")
 
@@ -877,7 +1086,7 @@ def main() -> None:
             print(f"endpoint_url={args.endpoint_url}")
         else:
             print(f"runtime_arn={args.runtime_arn}")
-            if args.operation == "probe":
+            if args.operation in {"probe", "async-start", "async-status", "async-list"}:
                 print(f"runtime_qualifier={args.runtime_qualifier}")
         print(f"sticky_session_id={args.session_id}")
 
@@ -890,7 +1099,7 @@ def main() -> None:
                 endpoint_url=args.endpoint_url,
             )
             print_ping_result(result, show_json=args.show_json)
-        else:
+        elif args.operation == "probe":
             result = probe_runtime(
                 boto_session=boto_session,
                 runtime_arn=args.runtime_arn,
@@ -900,6 +1109,44 @@ def main() -> None:
                 endpoint_url=args.endpoint_url,
             )
             print_probe_result(result, show_json=args.show_json)
+        elif args.operation == "async-start":
+            result = async_start_runtime(
+                boto_session=boto_session,
+                runtime_arn=args.runtime_arn,
+                region=args.region,
+                session_id=args.session_id,
+                qualifier=args.runtime_qualifier,
+                prompt=prompt_from_args(
+                    args.prompts,
+                    parser=parser,
+                    operation=args.operation,
+                ),
+                endpoint_url=args.endpoint_url,
+            )
+            print_async_result(result, show_json=args.show_json)
+        elif args.operation == "async-status":
+            if not args.task_id:
+                parser.error("--operation async-status requires --task-id.")
+            result = async_status_runtime(
+                boto_session=boto_session,
+                runtime_arn=args.runtime_arn,
+                region=args.region,
+                session_id=args.session_id,
+                qualifier=args.runtime_qualifier,
+                task_id=args.task_id,
+                endpoint_url=args.endpoint_url,
+            )
+            print_async_result(result, show_json=args.show_json)
+        else:
+            result = async_list_runtime(
+                boto_session=boto_session,
+                runtime_arn=args.runtime_arn,
+                region=args.region,
+                session_id=args.session_id,
+                qualifier=args.runtime_qualifier,
+                endpoint_url=args.endpoint_url,
+            )
+            print_async_result(result, show_json=args.show_json)
         return
 
     if args.transport == "ws":

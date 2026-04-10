@@ -32,6 +32,9 @@ SESSION_HEADER_CANONICAL = "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id"
 MAX_WS_MESSAGE_BYTES = 32 * 1024
 EVENT_STREAM_CONTENT_TYPE = "text/event-stream"
 PROBE_REQUEST_FIELD = "__agentcore_probe__"
+ASYNC_REQUEST_FIELD = "__agentcore_async__"
+ASYNC_TASK_HISTORY_LIMIT = int(os.environ.get("AGENTCORE_ASYNC_TASK_HISTORY_LIMIT", "20"))
+ASYNC_RUNNING_STATUSES = {"queued", "running"}
 DEFAULT_SYSTEM_PROMPT = os.environ.get(
     "CLAUDE_AGENT_SYSTEM_PROMPT",
     (
@@ -51,6 +54,7 @@ PERMISSION_MODE = os.environ.get("CLAUDE_AGENT_PERMISSION_MODE", "bypassPermissi
 MODEL = os.environ.get("ANTHROPIC_MODEL")
 LOG_LEVEL = os.environ.get("AGENTCORE_LOG_LEVEL", "INFO").upper()
 SESSION_STATES: dict[str, dict[str, Any]] = {}
+ASYNC_TASKS: dict[str, dict[str, dict[str, Any]]] = {}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -113,17 +117,298 @@ def _sticky_state(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _probe_response(runtime_session_id: str) -> dict[str, Any]:
-    return {
-        "status": "Healthy",
+def _probe_request_config(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+
+    raw = payload.get(PROBE_REQUEST_FIELD)
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    return {"invalid": True}
+
+
+def _probe_response(runtime_session_id: str, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    config = config or {}
+    session_active_tasks = _active_async_tasks(runtime_session_id)
+    total_active_tasks = _active_async_tasks()
+    status = "HealthyBusy" if session_active_tasks else "Healthy"
+    session_tasks = _session_async_tasks(runtime_session_id)
+
+    response = {
+        "status": status,
         "probe": True,
         "runtime_session_id": runtime_session_id,
+        "active_async_task_count": len(session_active_tasks),
+        "active_async_task_ids": [task["task_id"] for task in session_active_tasks],
+        "total_active_async_task_count": len(total_active_tasks),
         "boot_id": BOOT_ID,
         "pid": os.getpid(),
         "uptime_seconds": round(time.time() - BOOT_TIME, 3),
         "http_streaming_content_type": EVENT_STREAM_CONTENT_TYPE,
         "websocket_path": "/ws",
     }
+
+    task_id = str(config.get("task_id", "")).strip()
+    include_tasks = bool(config.get("include_tasks"))
+    include_result = bool(config.get("include_result"))
+
+    if task_id:
+        task = session_tasks.get(task_id)
+        response["task_id"] = task_id
+        if task is None:
+            response["task_found"] = False
+        else:
+            response["task_found"] = True
+            response["async_task"] = _task_status_summary(task, include_result=include_result)
+
+    if include_tasks:
+        tasks = sorted(
+            session_tasks.values(),
+            key=lambda item: item.get("created_at", 0),
+            reverse=True,
+        )
+        response["async_tasks"] = [
+            _task_status_summary(task, include_result=include_result) for task in tasks
+        ]
+
+    return response
+
+
+def _session_async_tasks(runtime_session_id: str) -> dict[str, dict[str, Any]]:
+    return ASYNC_TASKS.setdefault(runtime_session_id, {})
+
+
+def _async_request_config(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+
+    raw = payload.get(ASYNC_REQUEST_FIELD)
+    if raw is None or raw is False:
+        return None
+    if raw is True:
+        return {"action": "start"}
+    if isinstance(raw, str):
+        return {"action": raw}
+    if isinstance(raw, dict):
+        return raw
+    return {"action": "invalid"}
+
+
+def _active_async_tasks(runtime_session_id: str | None = None) -> list[dict[str, Any]]:
+    sessions: list[dict[str, dict[str, Any]]]
+    if runtime_session_id is None:
+        sessions = list(ASYNC_TASKS.values())
+    else:
+        sessions = [_session_async_tasks(runtime_session_id)]
+
+    active: list[dict[str, Any]] = []
+    for session_tasks in sessions:
+        active.extend(
+            task
+            for task in session_tasks.values()
+            if task.get("status") in ASYNC_RUNNING_STATUSES
+        )
+    return active
+
+
+def _task_status_summary(task: dict[str, Any], include_result: bool = False) -> dict[str, Any]:
+    payload = {
+        "task_id": task["task_id"],
+        "status": task["status"],
+        "prompt": task["prompt"],
+        "created_at": task["created_at"],
+        "started_at": task.get("started_at"),
+        "completed_at": task.get("completed_at"),
+        "runtime_session_id": task["runtime_session_id"],
+    }
+
+    if task.get("error"):
+        payload["error"] = task["error"]
+
+    result = task.get("result")
+    if result:
+        payload["response_preview"] = result.get("response", "")[:200]
+        if include_result:
+            payload["result"] = result
+
+    return payload
+
+
+def _prune_completed_async_tasks(runtime_session_id: str) -> None:
+    session_tasks = _session_async_tasks(runtime_session_id)
+    completed = [
+        task
+        for task in session_tasks.values()
+        if task.get("status") not in ASYNC_RUNNING_STATUSES
+    ]
+    overflow = len(completed) - ASYNC_TASK_HISTORY_LIMIT
+    if overflow <= 0:
+        return
+
+    for task in sorted(
+        completed,
+        key=lambda item: item.get("completed_at") or item.get("created_at") or 0,
+    )[:overflow]:
+        session_tasks.pop(task["task_id"], None)
+
+
+async def _run_async_task(task: dict[str, Any]) -> None:
+    runtime_session_id = task["runtime_session_id"]
+    task_id = task["task_id"]
+    task["status"] = "running"
+    task["started_at"] = time.time()
+    _log(
+        "async_task_started",
+        runtime_session_id=runtime_session_id,
+        task_id=task_id,
+        prompt_preview=task["prompt"][:200],
+    )
+
+    try:
+        task["result"] = await _run_turn(runtime_session_id, task["prompt"])
+        task["status"] = "completed"
+        _log(
+            "async_task_completed",
+            runtime_session_id=runtime_session_id,
+            task_id=task_id,
+            response_preview=task["result"].get("response", "")[:200],
+        )
+    except Exception as exc:
+        task["status"] = "failed"
+        task["error"] = str(exc)
+        _log(
+            "async_task_failed",
+            runtime_session_id=runtime_session_id,
+            task_id=task_id,
+            error=str(exc),
+        )
+    finally:
+        task["completed_at"] = time.time()
+        task.pop("runner", None)
+        _prune_completed_async_tasks(runtime_session_id)
+
+
+async def _start_async_task(
+    runtime_session_id: str,
+    prompt: str,
+) -> JSONResponse:
+    if not prompt.strip():
+        return JSONResponse(
+            {
+                "status": "error",
+                "error": "Async task start requires a non-empty prompt.",
+                "runtime_session_id": runtime_session_id,
+            },
+            status_code=400,
+        )
+
+    task_id = f"async-{uuid.uuid4()}"
+    task = {
+        "task_id": task_id,
+        "runtime_session_id": runtime_session_id,
+        "prompt": prompt,
+        "status": "queued",
+        "created_at": time.time(),
+        "started_at": None,
+        "completed_at": None,
+        "result": None,
+        "error": None,
+    }
+    _session_async_tasks(runtime_session_id)[task_id] = task
+    task["runner"] = asyncio.create_task(_run_async_task(task))
+    _log(
+        "async_task_queued",
+        runtime_session_id=runtime_session_id,
+        task_id=task_id,
+        prompt_preview=prompt[:200],
+    )
+    return JSONResponse(
+        {
+            "status": "accepted",
+            "async": True,
+            "async_action": "start",
+            "runtime_session_id": runtime_session_id,
+            "async_task": _task_status_summary(task),
+        },
+        status_code=202,
+    )
+
+
+async def _handle_async_request(
+    runtime_session_id: str,
+    request_payload: Any,
+) -> JSONResponse | None:
+    async_config = _async_request_config(request_payload)
+    if async_config is None:
+        return None
+
+    action = str(async_config.get("action", "start")).strip().lower()
+    prompt = _extract_prompt(request_payload)
+    session_tasks = _session_async_tasks(runtime_session_id)
+
+    if action == "start":
+        return await _start_async_task(runtime_session_id, prompt)
+
+    if action in {"status", "result"}:
+        task_id = str(async_config.get("task_id", "")).strip()
+        if not task_id:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": "Async task status requires task_id.",
+                    "runtime_session_id": runtime_session_id,
+                },
+                status_code=400,
+            )
+        task = session_tasks.get(task_id)
+        if task is None:
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": f"Unknown async task: {task_id}",
+                    "runtime_session_id": runtime_session_id,
+                },
+                status_code=404,
+            )
+        return JSONResponse(
+            {
+                "status": "success",
+                "async": True,
+                "async_action": "status",
+                "runtime_session_id": runtime_session_id,
+                "async_task": _task_status_summary(task, include_result=True),
+            }
+        )
+
+    if action == "list":
+        tasks = sorted(
+            session_tasks.values(),
+            key=lambda item: item.get("created_at", 0),
+            reverse=True,
+        )
+        return JSONResponse(
+            {
+                "status": "success",
+                "async": True,
+                "async_action": "list",
+                "runtime_session_id": runtime_session_id,
+                "active_async_task_count": len(_active_async_tasks(runtime_session_id)),
+                "async_tasks": [_task_status_summary(task) for task in tasks],
+            }
+        )
+
+    return JSONResponse(
+        {
+            "status": "error",
+            "error": f"Unsupported async action: {action}",
+            "runtime_session_id": runtime_session_id,
+        },
+        status_code=400,
+    )
 
 
 async def _get_or_create_session(runtime_session_id: str) -> dict[str, Any]:
@@ -173,7 +458,7 @@ def _extract_prompt(payload: Any) -> str:
 
 
 def _is_probe_request(payload: Any) -> bool:
-    return isinstance(payload, dict) and payload.get(PROBE_REQUEST_FIELD) is True
+    return _probe_request_config(payload) is not None
 
 
 def _session_id_from_request(request: Request) -> str:
@@ -434,10 +719,24 @@ async def _stream_turn_over_http(
 
 
 async def ping(_: Request) -> JSONResponse:
-    _log("ping")
+    runtime_session_id = _session_id_from_request(_)
+    session_active_tasks = _active_async_tasks(runtime_session_id)
+    total_active_tasks = _active_async_tasks()
+    status = "HealthyBusy" if session_active_tasks else "Healthy"
+    _log(
+        "ping",
+        runtime_session_id=runtime_session_id,
+        status=status,
+        session_active_async_task_count=len(session_active_tasks),
+        total_active_async_task_count=len(total_active_tasks),
+    )
     return JSONResponse(
         {
-            "status": "Healthy",
+            "status": status,
+            "runtime_session_id": runtime_session_id,
+            "active_async_task_count": len(session_active_tasks),
+            "active_async_task_ids": [task["task_id"] for task in session_active_tasks],
+            "total_active_async_task_count": len(total_active_tasks),
             "boot_id": BOOT_ID,
             "claude_code_use_bedrock": os.environ.get("CLAUDE_CODE_USE_BEDROCK"),
             "anthropic_model": os.environ.get("ANTHROPIC_MODEL"),
@@ -456,9 +755,32 @@ async def invocations(request: Request) -> JSONResponse:
     except (UnicodeDecodeError, json.JSONDecodeError):
         request_payload = {"raw": raw.decode("utf-8", errors="replace")}
 
-    if _is_probe_request(request_payload):
-        _log("invocation_probe", runtime_session_id=runtime_session_id)
-        return JSONResponse(_probe_response(runtime_session_id))
+    probe_config = _probe_request_config(request_payload)
+    if probe_config is not None:
+        _log(
+            "invocation_probe",
+            runtime_session_id=runtime_session_id,
+            probe_config=probe_config,
+        )
+        if probe_config.get("invalid"):
+            return JSONResponse(
+                {
+                    "status": "error",
+                    "error": "Probe config must be true or an object.",
+                    "runtime_session_id": runtime_session_id,
+                },
+                status_code=400,
+            )
+        return JSONResponse(_probe_response(runtime_session_id, probe_config))
+
+    async_response = await _handle_async_request(runtime_session_id, request_payload)
+    if async_response is not None:
+        _log(
+            "invocation_async",
+            runtime_session_id=runtime_session_id,
+            request_payload=request_payload,
+        )
+        return async_response
 
     prompt = _extract_prompt(request_payload)
     if not prompt and isinstance(request_payload, dict):
@@ -533,6 +855,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 request_payload = json.loads(raw_text) if raw_text else {}
             except json.JSONDecodeError:
                 request_payload = {"prompt": raw_text}
+
+            async_response = await _handle_async_request(runtime_session_id, request_payload)
+            if async_response is not None:
+                await websocket.send_json(async_response.body and json.loads(async_response.body))
+                continue
 
             prompt = _extract_prompt(request_payload)
             if not prompt:

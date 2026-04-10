@@ -8,22 +8,24 @@ The most recent follow-up changes enabled Claude Agent SDK partial message strea
 
 The latest changes added a reusable `dev.sh` workflow for local build, local run, ECR push, AgentCore deploy, CloudWatch log queries, and both local and deployed WebSocket checks. The runtime was also updated to emit structured JSON logs to stdout so AgentCore forwards startup, ping, WebSocket, and turn lifecycle events into CloudWatch Logs. The WebSocket client path was aligned with the AgentCore bidirectional streaming samples by using `qualifier` in the presigned URL and sending the runtime session ID in the `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` header.
 
-After confirming that public signed `GET /ping` requests return `404`, the runtime and client were extended with a lightweight signed `POST /invocations` probe. The runtime now short-circuits requests whose JSON body is `{"__agentcore_probe__": true}` and returns an immediate health payload without invoking Claude, while normal invocations keep their existing behavior.
+After confirming that public signed `GET /ping` requests return `404`, the runtime and client were extended with a lightweight signed `POST /invocations` probe. The runtime now short-circuits requests whose JSON body is `{"__agentcore_probe__": true}` and returns an immediate health payload without invoking Claude, while normal invocations keep their existing behavior. The latest probe update extends that path again so probe requests can surface async task state: plain probe returns `Healthy` or `HealthyBusy` plus async task counters, and probe requests that pass a `task_id` can return that task's current status and optional final result.
 
 The latest runtime update expanded Claude Code access for research and shell execution. The deployed image now allows `WebFetch` and `Bash`, switches the default SDK permission mode to `bypassPermissions`, enables Claude Code sandboxing inside the container with nested-sandbox support enabled, and sets `IS_SANDBOX=1` so bypass-permissions mode works correctly under the container's root user. After that change, both live Bash and WebFetch turns succeeded against the deployed runtime.
 
 The latest repo cleanup moved deployment-specific AWS identifiers out of tracked source files and into a local `.env` file, added a checked-in `.env.example`, and converted the IAM policy JSON files into env-backed templates that `bash dev.sh render-policies` can materialize into a local ignored `generated/` directory.
+
+The latest runtime change added AgentCore-style asynchronous background task support using the patterns described in the AgentCore long-running runtime documentation. `POST /invocations` now accepts reserved async control payloads to start work in the background and poll task state later, `GET /ping` returns `HealthyBusy` while a session has active background work, and both the local client and `dev.sh` expose commands for starting and inspecting async tasks. These changes were deployed live as image `v12` and verified against the deployed AgentCore runtime with real background Bash work plus CloudWatch lifecycle logs. The latest live deploy is `v13`, which adds task-aware probe responses on the same signed `POST /invocations` surface and verifies them against a real running and completed async task.
 
 ## Current Runtime
 
 - AWS account: from `.env` `AWS_ACCOUNT_ID`
 - Region: from `.env` `AWS_REGION`
 - Runtime ARN: from `.env` `AGENT_RUNTIME_ARN`
-- Runtime version: `10`
+- Runtime version: `12`
 - IAM role: from `.env` `AGENT_RUNTIME_ROLE_NAME`
 - ECR repository: from `.env` `ECR_REPOSITORY_URI`
-- Current image tag: `v11`
-- Current image digest: `sha256:be4f9c2b90aa04fa412b6001bd60ab9a033d833695218ab3f9bf7a469bbe2310`
+- Current image tag: `v13`
+- Current image digest: `sha256:bfa298a270c3e1c4fd191de2403ec405776ed8d4c9fdaa46f88b6764c1bcf4b0`
 
 ## Files and Purpose
 
@@ -54,8 +56,12 @@ The latest repo cleanup moved deployment-specific AWS identifiers out of tracked
   - Exposes `GET /ping`, `POST /invocations`, and WebSocket `/ws`
   - Maintains one `ClaudeSDKClient` per runtime session ID
   - Preserves sticky state in memory inside `SESSION_STATES`
+  - Tracks per-session background tasks in memory for AgentCore-style async execution
   - Emits structured JSON logs to stdout for startup, ping, WebSocket connections, and turn lifecycle events so AgentCore forwards them into CloudWatch Logs
-  - Short-circuits `POST /invocations` probe bodies that contain `{"__agentcore_probe__": true}` and returns an immediate health payload without invoking Claude
+  - Short-circuits `POST /invocations` probe bodies that contain `{"__agentcore_probe__": ...}` and returns an immediate health payload without invoking Claude
+  - Probe responses now include async task counters, and can return one task's current status plus optional final result when a probe payload includes `task_id`
+  - Accepts async control payloads on `POST /invocations` and WebSocket messages via `{"__agentcore_async__": ...}` with actions `start`, `status`, and `list`
+  - Returns `{"status":"HealthyBusy"}` from `GET /ping` when the current runtime session still has queued or running background tasks
   - Passes Claude Code sandbox settings into `ClaudeAgentOptions(...)`
   - Passes `IS_SANDBOX=1` into the Claude subprocess environment by default
   - Logs the effective `allowed_tools`, `permission_mode`, `sandbox`, and Claude subprocess env at startup
@@ -83,6 +89,7 @@ The latest repo cleanup moved deployment-specific AWS identifiers out of tracked
   - Invokes the AgentCore runtime with a chosen runtime session ID
   - Supports a dedicated `--operation ping` mode for `GET /ping`
   - Supports a dedicated `--operation probe` mode for a lightweight signed `POST /invocations` health check
+  - Supports `--operation async-start`, `--operation async-status`, and `--operation async-list` over the same signed `POST /invocations` path
   - Supports both HTTP and bidirectional WebSocket transports
   - Supports direct WebSocket checks against either a presigned AgentCore runtime URL or a local `ws://.../ws` endpoint via `--ws-url`
   - In HTTP streaming mode, consumes `text/event-stream` output incrementally and prints assistant text as `assistant_delta` chunks arrive
@@ -102,6 +109,9 @@ The latest repo cleanup moved deployment-specific AWS identifiers out of tracked
     - `/help`
     - `/ping` in HTTP mode
     - `/probe` in HTTP mode
+    - `/async <prompt>` in HTTP mode
+    - `/task <task_id>` in HTTP mode
+    - `/tasks` in HTTP mode
     - `/session`
     - `/new`
     - `/quit`
@@ -111,9 +121,11 @@ The latest repo cleanup moved deployment-specific AWS identifiers out of tracked
 - `dev.sh`
   - Automates local Docker build and local container workflows
   - Loads deployment-specific configuration from `.env` when present
+  - Preserves shell-provided env overrides instead of letting `.env` overwrite them
   - Can render env-backed IAM policy templates with `render-policies`
   - Can smoke-test the local runtime with `GET /ping` and streaming `POST /invocations`
   - Can run a lightweight health probe through `probe-local` and `probe-aws`
+  - Can start and inspect local or deployed background tasks with `async-start-*`, `async-status-*`, and `async-list-*`
   - Can check both local and deployed WebSocket connectivity using the same SigV4 and direct-`ws://` patterns used in the AgentCore bidirectional streaming samples
   - Can resolve and query the runtime's CloudWatch Logs group with `logs-aws-group`, `logs-aws-streams`, `logs-aws`, and `logs-aws-follow`
   - Can log in to ECR, push a tagged image, update the AgentCore runtime to that image digest, and wait for `READY`
@@ -374,6 +386,77 @@ Verification completed on April 7, 2026:
 - Verified `bash dev.sh render-policies` writes concrete JSON files into `generated/`
 - Verified tracked files no longer contain the previously hard-coded account ID, runtime ID, role name, or ECR repository name
 
+### Async Background Task Support
+
+The runtime was updated to support AgentCore-style asynchronous background tasks without changing the main synchronous invoke path.
+
+Verification completed on April 8, 2026:
+
+- Added reserved async control payloads on `POST /invocations` and WebSocket frames using `{"__agentcore_async__": ...}`
+- Added support for async task actions `start`, `status`, and `list`
+- Updated `GET /ping` to return `HealthyBusy` when the current runtime session has queued or running background tasks
+- Updated `sticky_session_client.py` with `--operation async-start`, `--operation async-status`, `--operation async-list`, plus interactive `/async`, `/task`, and `/tasks`
+- Updated `dev.sh` with `async-start-local`, `async-start-aws`, `async-status-local`, `async-status-aws`, `async-list-local`, and `async-list-aws`
+- Verified `python3 -m py_compile app.py sticky_session_client.py`
+- Verified `bash -n dev.sh`
+- Verified local ASGI smoke tests with a stubbed `_run_turn(...)` show:
+  - async start returns HTTP `202`
+  - `GET /ping` returns `HealthyBusy` while the task is running
+  - async status returns `running` during execution and `completed` with the final result afterward
+  - the same async control flow works over WebSockets
+
+Additional live verification completed on April 8, 2026:
+
+- Built and pushed image tag `v12`
+- Updated the AgentCore runtime to version `11`
+- Verified the deployed runtime now points at image digest `sha256:cf2ad61809e9b24f7c1f73ad8bced291cd5b5cd6e515016b9a8b26d0c09b2c56`
+- Started a live async task with:
+
+`python3 sticky_session_client.py --profile default --region us-east-1 --runtime-arn arn:aws:bedrock-agentcore:us-east-1:339543757547:runtime/CodexDockerEcho20260406-hUwkgF2f99 --runtime-qualifier DEFAULT --session-id live-async-verify-20260408-0002-long --operation async-start --prompts "Use the Bash tool to run 'sleep 15 && printf ok' and then reply with exactly ok."`
+
+- Observed:
+  - async start returned HTTP `202`
+  - immediate async status returned `running`
+  - immediate async list returned `active=1`
+  - later async status returned `completed`
+  - final assistant result was `ok`
+- Queried CloudWatch Logs for the same session and observed:
+  - `async_task_queued`
+  - `async_task_started`
+  - `turn_started`
+  - `turn_completed`
+  - `async_task_completed`
+- This confirmed the deployed runtime now supports the async background task flow end to end
+
+Additional tooling follow-up completed on April 8, 2026:
+
+- Updated `dev.sh` so shell-provided env overrides such as `LOCAL_SESSION_ID=... bash dev.sh async-start-aws ...` are no longer overwritten by `.env`
+- Updated `bash dev.sh config` to print `LOCAL_SESSION_ID`
+
+### Task-Aware Probe Verification
+
+The signed `/invocations` probe path was updated so probe responses can report async task status without using the separate async status action.
+
+Verification completed on April 8, 2026:
+
+- Built and pushed image tag `v13`
+- Updated the AgentCore runtime to version `12`
+- Verified the deployed runtime now points at image digest `sha256:bfa298a270c3e1c4fd191de2403ec405776ed8d4c9fdaa46f88b6764c1bcf4b0`
+- Ran a plain probe with `{"__agentcore_probe__": true}` against a fresh live session and observed:
+  - `status=Healthy`
+  - `active_async_task_count=0`
+- Started a live async task in the same session and then ran a task-aware probe with `{"__agentcore_probe__":{"task_id":"..."}}`
+- Observed during execution:
+  - `status=HealthyBusy`
+  - `task_found=true`
+  - `async_task.status=running`
+- Ran a completed probe with `{"__agentcore_probe__":{"task_id":"...","include_result":true,"include_tasks":true}}`
+- Observed after completion:
+  - `status=Healthy`
+  - `async_task.status=completed`
+  - the final result payload was included and the assistant response was `ok`
+- This confirmed the live probe path now works as an external status check for both session health and individual async task state
+
 ## Current Usage
 
 Run the interactive sticky-session client with:
@@ -462,6 +545,24 @@ Run the lightweight probe directly against a local container with:
 bash /Users/ryfeus/Code/claude-code-agentcore/dev.sh probe-local
 ```
 
+Start a local background task and inspect it later with:
+
+```bash
+bash /Users/ryfeus/Code/claude-code-agentcore/dev.sh async-start-local \
+  "Research the latest Bedrock AgentCore long-running runtime guidance and summarize it"
+bash /Users/ryfeus/Code/claude-code-agentcore/dev.sh async-list-local
+bash /Users/ryfeus/Code/claude-code-agentcore/dev.sh async-status-local <task_id>
+```
+
+Start a deployed background task and inspect it later with:
+
+```bash
+bash /Users/ryfeus/Code/claude-code-agentcore/dev.sh async-start-aws \
+  "Research the latest Bedrock AgentCore long-running runtime guidance and summarize it"
+bash /Users/ryfeus/Code/claude-code-agentcore/dev.sh async-list-aws
+bash /Users/ryfeus/Code/claude-code-agentcore/dev.sh async-status-aws <task_id>
+```
+
 Use WebSocket streaming mode with:
 
 ```bash
@@ -493,11 +594,16 @@ python3 /Users/ryfeus/Code/claude-code-agentcore/sticky_session_client.py \
 - The client normalizes short session IDs to meet the runtime minimum length requirement
 - The HTTP streaming client path now renders SSE events incrementally instead of buffering the whole response before printing
 - The client now supports `--operation ping` and interactive `/ping` in HTTP mode
-- The runtime now treats `{"__agentcore_probe__": true}` as a reserved lightweight health probe payload on `POST /invocations`
+- The runtime now treats `{"__agentcore_probe__": ...}` as a reserved lightweight health probe payload on `POST /invocations`
+- Probe responses now surface `Healthy` versus `HealthyBusy`, async task counters, and optional per-task status/result details when a probe payload includes `task_id`
+- The runtime now also treats `{"__agentcore_async__": ...}` as a reserved async task control payload on `POST /invocations` and WebSocket frames
 - The client now supports `--operation probe` and interactive `/probe` in HTTP mode
+- The client now supports `--operation async-start`, `--operation async-status`, `--operation async-list`, plus `/async`, `/task`, and `/tasks` in interactive HTTP mode
 - `bash dev.sh probe-aws` is now the public health check that uses the same signed `/invocations` surface as normal traffic
+- `GET /ping` now returns `HealthyBusy` for a session while that session still has queued or running background work
+- The public signed AWS `GET /ping` route still appears unavailable externally, so live async verification is currently done through async `status` / `list` calls plus CloudWatch logs rather than direct public `/ping`
 - Claude Code sandboxing is now enabled in the runtime with nested-sandbox support turned on
-- Forced live `Bash` and `WebFetch` turns both work on the deployed `v11` runtime after adding `IS_SANDBOX=1`
+- Forced live `Bash` and `WebFetch` turns both work on the deployed runtime after adding `IS_SANDBOX=1`
 - The WebSocket client now presigns `wss://.../ws?qualifier=DEFAULT` and sends the runtime session ID in the `X-Amzn-Bedrock-AgentCore-Runtime-Session-Id` header, which matches the AgentCore bidirectional streaming samples
 - A signed AWS `GET /ping` request against the deployed runtime returned HTTP `404` on April 7, 2026, so the public runtime URL may not expose `/ping` the same way it exposes `/invocations`
 - The WebSocket handler currently accepts text frames and JSON payloads that contain `prompt`, `inputText`, `text`, or `message`
@@ -518,9 +624,11 @@ The sequence of user requests in the previous session was:
 
 ## Likely Next Steps
 
+- Decide whether async task metadata should survive container restarts or remain in-memory only
+- Add first-class client and `dev.sh` helpers for task-aware probe payloads so external checks can query one async task without hand-crafted JSON
 - Add a concrete research-oriented demo flow that showcases `WebFetch` over HTTP streaming or WebSockets
+- Decide whether long-running async tasks need cancellation, task TTL cleanup, or concurrency limits per session
 - Decide whether additional tools should be enabled beyond `Read`, `Glob`, `Grep`, `WebFetch`, and `Bash`
 - Change the default Bedrock model if a different Claude tier is preferred for the runtime
 - Add cleanup scripts for the IAM role, runtime, and ECR resources
-- Reduce noisy background `/ping` activity if it becomes a CloudWatch cost or signal-to-noise issue
 - Add richer CloudWatch log filtering helpers to `dev.sh` if session-specific debugging becomes common
